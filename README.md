@@ -3,7 +3,7 @@
 C++ sockets project that implements a **publisher–subscriber (pub/sub)** messaging model over **TCP** and **UDP**.  
 Payloads are **Base64-encoded** so they’re printable and easy to log/debug.
 
-## Overvie
+## Overview
 
 - A **Server** acts as a broker for **topics**.
 - **Clients** can run as **Publisher** (send messages to a topic) or **Subscriber** (receive messages from one or more topics).
@@ -22,4 +22,10 @@ Payloads are **Base64-encoded** so they’re printable and easy to log/debug.
 - No external libraries; simple, readable C++
 
 
+## Run
 
+### 1) Start the server
+```bash
+./server <port>
+# example
+./server 9000
