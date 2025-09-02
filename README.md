@@ -21,11 +21,31 @@ Payloads are **Base64-encoded** so they’re printable and easy to log/debug.
 - **Multi-topic subscription**
 - No external libraries; simple, readable C++
 
+## Build
+```bash
+g++ server.cpp -o server
+g++ client.cpp -o client
+```
 
 ## Run
 
-### 1) Start the server
+### 1) Start the server(Terminal 1)
 ```bash
 ./server <port>
 # example
 ./server 9000
+```
+### 2) Start a subscriber(Terminal 2)
+```bash
+./client <server_ip> <port> <tcp|udp> sub <topic1> [topic2 ...]
+# examples
+./client 127.0.0.1 9000 tcp sub sports
+./client 127.0.0.1 9000 udp sub sports tech
+```
+### 3) Start a publisher(Terminal 3)
+```bash
+./client <server_ip> <port> <tcp|udp> pub <topic>
+# examples
+./client 127.0.0.1 9000 tcp pub sports
+./client 127.0.0.1 9000 udp pub sports
+# then type a line and press Enter to publish
