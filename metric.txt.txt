@@ -1,0 +1,89 @@
+1.ts_ms
+
+What: Monotonic timestamp in milliseconds from a steady clock (good for comparing rows; not wall-clock time).
+
+How: Captured with steady_clock::now() when the snapshot is written.
+
+Use: Compute rates (e.g., publishes per second) by differencing consecutive rows.
+
+2.total_publishes
+
+What: Count of publish requests the broker processed (TCP + UDP).
+
+How: +1 each time a PUBLISH is handled (after reading the packet, before ACK).
+
+Use: Denominator for fanout; overall traffic volume.
+
+3.total_deliveries
+
+What: Total messages delivered to subscribers (across TCP & UDP).
+
+How: For each publish, broker fans out to all current subscribers of the topic; it adds the number of successful sends returned by the fanout routine.
+
+Caveat: For UDP, “delivered” means packet handed to the OS with sendto, not confirmed by the subscriber.
+
+4.avg_fanout
+
+What: Average subscribers reached per publish.
+
+Formula: avg_fanout = total_deliveries / total_publishes (0 if no publishes yet).
+
+Interpret:
+
+~0 ⇒ you’re publishing to topics with no subscribers.
+
+~N ⇒ on average, each publish reached N subscribers.
+
+5.tcp_current
+
+What: Current number of active TCP clients connected to the broker.
+
+How: +1 on each successful accept(), -1 when a client handler finishes and closes the socket.
+
+Note: UDP “clients” aren’t counted here (connectionless).
+
+6.tcp_peak
+
+What: Highest concurrent TCP client count observed since start.
+
+How: After incrementing tcp_current, an atomic CAS updates tcp_peak if needed.
+
+Use (interview): “This instance sustained tcp_peak concurrent TCP connections during test.”
+
+7.bytes_tcp_in
+
+What: Total TCP bytes received by the broker.
+
+How: Incremented on every recv() that reads header + topic + payload.
+
+Includes: Protocol header and payload (exact on-the-wire counts seen by the app).
+
+8.bytes_tcp_out
+
+What: Total TCP bytes sent by the broker.
+
+How: Incremented on every send() (ACKs + message fanout to TCP subscribers).
+
+Use: With bytes_tcp_in, shows overhead and amplification due to fanout.
+
+9.bytes_udp_in
+
+What: Total UDP bytes received by the broker.
+
+How: Incremented by the byte count returned from recvfrom() (header + topic + payload).
+
+10.bytes_udp_out
+
+What: Total UDP bytes sent by the broker.
+
+How: Incremented by the byte count passed to sendto() during fanout/ACK.
+
+11.avg_pub_latency_us
+
+What: Average broker fanout latency in microseconds per publish.
+
+How: For each publish, the server timestamps just before calling fanout, and again right after; it sums the microseconds and divides by publish count.
+
+Exactly measures: Time spent inside the broker to dispatch one publish to all current subscribers (includes the send/sendto calls and OS buffering; excludes reading the publish from the client and excludes subscriber processing).
+
+Not the same as: End-to-end latency (publisher → subscriber receive). For true E2E, we’d add a tiny client-side metric; you can do that later if you want.
