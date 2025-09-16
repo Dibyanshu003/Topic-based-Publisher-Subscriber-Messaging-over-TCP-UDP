@@ -1,8 +1,4 @@
-// server.cpp — Hybrid TCP+UDP Pub/Sub Broker (Base64 passthrough)
-// - Supports TCP and UDP clients simultaneously on the same port
-// - Cross-transport fanout works: UDP pubs -> TCP subs and TCP pubs -> UDP subs
-// - Clear logs for connect/subscribe/publish/terminate; no ACK logs
-//
+// server.cpp — Hybrid TCP+UDP Pub/Sub Broker (Base64 passthrough) + lightweight metrics
 // Build: g++ -std=c++17 -O2 -pthread server.cpp -o server
 
 #include <arpa/inet.h>
@@ -14,6 +10,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <set>
@@ -21,10 +18,11 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 using namespace std;
 
-// Protocol
+//==================== Protocol ====================
 const int SUBSCRIBE = 1;
 const int PUBLISH   = 2;
 const int MSG       = 3;
@@ -33,12 +31,65 @@ const int TERM      = 5;
 
 struct Header { int type, topic_len, payload_len; };
 
-// Globals 
-static mutex g_mu;
-static atomic<int> next_id{1};
-static int g_udp_fd = -1;  // used for all UDP fanout sends
+//==================== Metrics ====================
+struct Metrics {
+    atomic<long long> total_publishes{0};
+    atomic<long long> total_deliveries{0};
 
-// Pretty ip:port
+    atomic<long long> bytes_tcp_in{0};
+    atomic<long long> bytes_tcp_out{0};
+    atomic<long long> bytes_udp_in{0};
+    atomic<long long> bytes_udp_out{0};
+
+    atomic<long long> tcp_current{0};
+    atomic<long long> tcp_peak{0};
+
+    // publish handling latency at broker (fanout duration)
+    atomic<long long> pub_latency_us_sum{0};
+    atomic<long long> pub_latency_count{0};
+} M;
+
+static const char* METRICS_FILE = "metrics_server.csv";
+static atomic<bool> metrics_header_written{false};
+
+static long long now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static void write_metrics_snapshot() {
+    ofstream f(METRICS_FILE, ios::app);
+    if(!f) return;
+    if(!metrics_header_written.exchange(true)) {
+        f << "ts_ms,total_publishes,total_deliveries,avg_fanout,"
+          << "tcp_current,tcp_peak,"
+          << "bytes_tcp_in,bytes_tcp_out,bytes_udp_in,bytes_udp_out,"
+          << "avg_pub_latency_us\n";
+    }
+    long long pubs = M.total_publishes.load();
+    long long dels = M.total_deliveries.load();
+    double avg_fanout = pubs ? (double)dels / (double)pubs : 0.0;
+
+    long long lat_cnt = M.pub_latency_count.load();
+    double avg_lat_us = lat_cnt ? (double)M.pub_latency_us_sum.load() / (double)lat_cnt : 0.0;
+
+    f << now_ms() << ","
+      << pubs << "," << dels << "," << avg_fanout << ","
+      << M.tcp_current.load() << "," << M.tcp_peak.load() << ","
+      << M.bytes_tcp_in.load() << "," << M.bytes_tcp_out.load() << ","
+      << M.bytes_udp_in.load() << "," << M.bytes_udp_out.load() << ","
+      << avg_lat_us << "\n";
+}
+
+static void metrics_snapshot_loop() {
+    // write every 2 seconds
+    while(true) {
+        this_thread::sleep_for(std::chrono::seconds(2));
+        write_metrics_snapshot();
+    }
+}
+
+//==================== Pretty addr ====================
 static string ipport_str(const sockaddr_in& a){
     char ip[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
@@ -50,7 +101,7 @@ static string ip_from_fd(int fd){
     return "unknown";
 }
 
-// Endpoint (subscriber identity)
+//==================== Endpoint & Client State ====================
 struct Endpoint{
     bool is_tcp = true;
     int  fd     = -1;      // valid when is_tcp=true
@@ -63,7 +114,6 @@ static bool endpoint_eq_udp(const Endpoint& e, const sockaddr_in& a){
     return !e.is_tcp && e.addr.sin_addr.s_addr==a.sin_addr.s_addr && e.addr.sin_port==a.sin_port;
 }
 
-// Per-client state (for logs/summary)
 struct ClientStateTCP {
     int fd=-1, id=0;
     string remote; // "ip:port"
@@ -77,17 +127,22 @@ struct ClientStateUDP {
     set<string> topics;
 };
 
-// Broker tables
+//==================== Globals (broker state) ====================
+static mutex g_mu;
+static atomic<int> next_id{1};
+static int g_udp_fd = -1;  // used for all UDP fanout sends
+
 static unordered_map<string, vector<Endpoint>> topic_subs; // topic -> endpoints
 static unordered_map<int, ClientStateTCP> clients_tcp;      // fd -> state
 static unordered_map<string, ClientStateUDP> clients_udp;   // "ip:port" -> state
 
-// I/O helpers (TCP framing)
+//==================== I/O helpers (TCP) ====================
 static bool send_all(int fd, const void* buf, size_t len){
     const char* p=(const char*)buf;
     while(len){
         ssize_t n=send(fd,p,len,0);
         if(n<0){ if(errno==EINTR) continue; return false; }
+        M.bytes_tcp_out.fetch_add(n);
         p+=n; len-= (size_t)n;
     }
     return true;
@@ -98,6 +153,7 @@ static bool recv_all(int fd, void* buf, size_t len){
         ssize_t n=recv(fd,p,len,0);
         if(n==0) return false;
         if(n<0){ if(errno==EINTR) continue; return false; }
+        M.bytes_tcp_in.fetch_add(n);
         p+=n; len-= (size_t)n;
     }
     return true;
@@ -119,7 +175,7 @@ static bool recv_packet_tcp(int fd, int& type, string& topic, string& payload){
     return true;
 }
 
-// I/O helpers (UDP datagrams)
+//==================== I/O helpers (UDP) ====================
 static bool send_packet_udp(int ufd, const sockaddr_in& to, int type, const string& topic, const string& payload){
     Header h; h.type=htonl(type); h.topic_len=htonl((int)topic.size()); h.payload_len=htonl((int)payload.size());
     vector<char> buf; buf.reserve(sizeof(h)+topic.size()+payload.size());
@@ -127,10 +183,11 @@ static bool send_packet_udp(int ufd, const sockaddr_in& to, int type, const stri
     buf.insert(buf.end(), topic.begin(), topic.end());
     buf.insert(buf.end(), payload.begin(), payload.end());
     ssize_t n = sendto(ufd, buf.data(), buf.size(), 0, (const sockaddr*)&to, sizeof(to));
+    if(n>0) M.bytes_udp_out.fetch_add(n);
     return n==(ssize_t)buf.size();
 }
 
-// Subscription management
+//==================== Subscription management ====================
 static void add_subscription_tcp(const string& topic, int fd){
     lock_guard<mutex> lk(g_mu);
     auto& list = topic_subs[topic];
@@ -171,7 +228,7 @@ static void remove_all_subs_for_udp_addr(const sockaddr_in& a){
     }
 }
 
-// Fanout (uses global g_udp_fd)
+//==================== Fanout ====================
 static int fanout_to_topic(const string& topic, const string& payload_b64){
     vector<Endpoint> targets;
     {
@@ -190,13 +247,13 @@ static int fanout_to_topic(const string& topic, const string& payload_b64){
     return delivered;
 }
 
-// ACK helpers
+//==================== ACK helpers ====================
 static inline void send_ack_tcp(int fd){ (void)send_packet_tcp(fd, ACK, "", ""); }
 static inline void send_ack_udp(const sockaddr_in& to){
     if(g_udp_fd>=0) (void)send_packet_udp(g_udp_fd, to, ACK, "", "");
 }
 
-// TCP client handler
+//==================== TCP client handler ====================
 static void handle_tcp_client(int cfd){
     // register
     ClientStateTCP my{};
@@ -224,8 +281,19 @@ static void handle_tcp_client(int cfd){
                 auto it = clients_tcp.find(cfd);
                 if(it!=clients_tcp.end()) it->second.acted_as_pub = true;
             }
+            // metrics: publish count + latency + deliveries
+            auto t0 = chrono::steady_clock::now();
             int fan = fanout_to_topic(topic, payload_b64);
-            cerr << "[PUBLISH]     Client#" << my.id << " via TCP -> '" << topic << "' fanout=" << fan << "\n";
+            auto t1 = chrono::steady_clock::now();
+            long long us = chrono::duration_cast<chrono::microseconds>(t1 - t0).count();
+
+            M.total_publishes.fetch_add(1);
+            M.total_deliveries.fetch_add(fan);
+            M.pub_latency_us_sum.fetch_add(us);
+            M.pub_latency_count.fetch_add(1);
+
+            cerr << "[PUBLISH]     Client#" << my.id << " via TCP -> '" << topic
+                 << "' fanout=" << fan << " latency_us=" << us << "\n";
             send_ack_tcp(cfd);
 
         }else if(type==TERM){
@@ -233,7 +301,6 @@ static void handle_tcp_client(int cfd){
             break;
         }
     }
-
 
     ClientStateTCP cs{};
     {
@@ -255,11 +322,11 @@ static void handle_tcp_client(int cfd){
         bool first=true; for(const auto& t: cs.topics){ if(!first) cerr<<", "; cerr<<"'"<<t<<"'"; first=false; }
         cerr << ".\n";
     }
-
+    M.tcp_current.fetch_sub(1);
     ::close(cfd);
 }
 
-// UDP loop 
+//==================== UDP loop ====================
 static void udp_loop(){
     vector<char> buf(64*1024);
     for(;;){
@@ -267,6 +334,7 @@ static void udp_loop(){
         ssize_t n = recvfrom(g_udp_fd, buf.data(), buf.size(), 0, (sockaddr*)&from, &flen);
         if(n<=0){ if(errno==EINTR) continue; perror("recvfrom"); continue; }
         if((size_t)n < sizeof(Header)) continue;
+        M.bytes_udp_in.fetch_add(n);
 
         Header h{};
         memcpy(&h, buf.data(), sizeof(h));
@@ -308,8 +376,19 @@ static void udp_loop(){
                 lock_guard<mutex> lk(g_mu);
                 clients_udp[key].acted_as_pub = true;
             }
+            // metrics: publish count + latency + deliveries
+            auto t0 = chrono::steady_clock::now();
             int fan = fanout_to_topic(topic, payload_b64);
-            cerr << "[PUBLISH]     Client#" << cs.id << " via UDP -> '" << topic << "' fanout=" << fan << "\n";
+            auto t1 = chrono::steady_clock::now();
+            long long us = chrono::duration_cast<chrono::microseconds>(t1 - t0).count();
+
+            M.total_publishes.fetch_add(1);
+            M.total_deliveries.fetch_add(fan);
+            M.pub_latency_us_sum.fetch_add(us);
+            M.pub_latency_count.fetch_add(1);
+
+            cerr << "[PUBLISH]     Client#" << cs.id << " via UDP -> '" << topic
+                 << "' fanout=" << fan << " latency_us=" << us << "\n";
             send_ack_udp(from);
 
         }else if(type==TERM){
@@ -337,7 +416,7 @@ static void udp_loop(){
     }
 }
 
-// Main
+//==================== Main ====================
 int main(int argc, char** argv){
     if(argc!=2){ cerr<<"Usage: ./server <port>\n"; return 1; }
     int port = stoi(argv[1]);
@@ -358,18 +437,37 @@ int main(int argc, char** argv){
 
     cout << "Broker listening on TCP+UDP port " << port << "...\n";
 
-    // Start UDP loop thread
+    // Start UDP loop and metrics snapshot thread
     thread(udp_loop).detach();
+    thread(metrics_snapshot_loop).detach();
 
     // TCP accept loop
     while(true){
         sockaddr_in caddr{}; socklen_t clen=sizeof(caddr);
         int cfd = accept(tfd, (sockaddr*)&caddr, &clen);
         if(cfd<0){ if(errno==EINTR) continue; perror("accept"); break; }
+
+        // metrics: tcp_current/peak
+        long long cur = M.tcp_current.fetch_add(1) + 1;
+        long long prev = M.tcp_peak.load();
+        while(cur > prev && !M.tcp_peak.compare_exchange_weak(prev, cur)) {
+            /* retry CAS */
+        }
+
         thread(handle_tcp_client, cfd).detach();
+
+        // when a TCP client finishes, handle_tcp_client() closes it
+        // we decrement current count here via a small watcher thread
+        // (avoid modifying handle_tcp_client’s end to keep separation)
+        thread([cfd](){
+            // wait for FIN-ish by polling getpeername(readiness is inferred by read failure in handler)
+            // Here we simply busy-wait on SO_ERROR via getsockopt returning non-zero after handler closes.
+            // To keep it simple and robust, decrement in handle close path instead:
+        }).detach();
     }
 
     ::close(tfd);
     ::close(g_udp_fd);
     return 0;
 }
+
