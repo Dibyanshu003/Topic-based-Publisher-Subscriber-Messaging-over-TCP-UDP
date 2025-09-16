@@ -20,6 +20,7 @@ Payloads are **Base64-encoded** so they’re printable and easy to log/debug.
 - **ACK** flow for subscribe/publish
 - **Multi-topic subscription**
 - No external libraries; simple, readable C++
+- Lightweight performance metrics: broker latency (µs), avg_fanout, TCP/UDP bytes in/out, and concurrent TCP (current/peak) — auto-logged to CSV.
 
 ## Build
 ```bash
